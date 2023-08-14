@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import jraph
 import numpy as np
 import xarray
+import haiku as hk
 
 Kwargs = Mapping[str, Any]
 
@@ -365,7 +366,7 @@ class GraphCast(predictor_base.Predictor):
     # Convert all input data into flat vectors for each of the grid nodes.
     # xarray (batch, time, lat, lon, level, multiple vars, forcings)
     # -> [num_grid_nodes, batch, num_channels]
-    grid_node_features = self._inputs_to_grid_node_features(inputs, forcings)
+    grid_node_features = (self._inputs_to_grid_node_features)(inputs, forcings)
 
     # Transfer data for the grid to the mesh,
     # [num_mesh_nodes, batch, latent_size], [num_grid_nodes, batch, latent_size]
@@ -657,7 +658,8 @@ class GraphCast(predictor_base.Predictor):
         })
 
     # Run the GNN.
-    grid2mesh_out = self._grid2mesh_gnn(input_graph)
+    grid2mesh_out = hk.remat(self._grid2mesh_gnn)(input_graph)
+    #grid2mesh_out = (self._grid2mesh_gnn)(input_graph)
     latent_mesh_nodes = grid2mesh_out.nodes["mesh_nodes"].features
     latent_grid_nodes = grid2mesh_out.nodes["grid_nodes"].features
     return latent_mesh_nodes, latent_grid_nodes
@@ -695,7 +697,8 @@ class GraphCast(predictor_base.Predictor):
         edges={mesh_edges_key: new_edges}, nodes={"mesh_nodes": nodes})
 
     # Run the GNN.
-    return self._mesh_gnn(input_graph).nodes["mesh_nodes"].features
+    output_graph = (self._mesh_gnn)(input_graph)
+    return output_graph.nodes["mesh_nodes"].features
 
   def _run_mesh2grid_gnn(self,
                          updated_latent_mesh_nodes: chex.Array,
@@ -731,7 +734,7 @@ class GraphCast(predictor_base.Predictor):
         })
 
     # Run the GNN.
-    output_graph = self._mesh2grid_gnn(input_graph)
+    output_graph = (self._mesh2grid_gnn)(input_graph)
     output_grid_nodes = output_graph.nodes["grid_nodes"].features
 
     return output_grid_nodes

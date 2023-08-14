@@ -112,7 +112,7 @@ class Predictor(predictor_base.Predictor):
                        f'forcings, which isn\'t allowed: {overlap}')
 
   def _update_inputs(self, inputs, next_frame):
-    num_inputs = inputs.dims['time']
+    num_inputs = inputs.sizes['time']
 
     predicted_or_forced_inputs = next_frame[list(inputs.keys())]
 
@@ -199,10 +199,13 @@ class Predictor(predictor_base.Predictor):
       return next_inputs, flat_pred
 
     if self._gradient_checkpointing:
-      scan_length = targets_template.dims['time']
+      scan_length = targets_template.sizes['time']
       if scan_length <= 1:
-        logging.warning(
-            'Skipping gradient checkpointing for sequence length of 1')
+        pass
+        # Disable a warning message about gradient checkpointing, since the option
+        # is generally enabled in code that calls Predictor
+        # logging.warning(
+        #     'Skipping gradient checkpointing for sequence length of 1')
       else:
         # Just in case we take gradients (e.g. for control), although
         # in most cases this will just be for a forward pass.
@@ -287,7 +290,7 @@ class Predictor(predictor_base.Predictor):
       return next_inputs, (loss, diagnostics)
 
     if self._gradient_checkpointing:
-      scan_length = targets.dims['time']
+      scan_length = targets.sizes['time']
       if scan_length <= 1:
         logging.warning(
             'Skipping gradient checkpointing for sequence length of 1')

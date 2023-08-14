@@ -159,13 +159,13 @@ class DeepTypedGraphNet(hk.Module):
     self._networks_builder(input_graph)
 
     # Embed input features (if applicable).
-    latent_graph_0 = self._embed(input_graph)
+    latent_graph_0 = (self._embed)(input_graph)
 
     # Do `m` message passing steps in the latent graphs.
-    latent_graph_m = self._process(latent_graph_0)
+    latent_graph_m = (self._process)(latent_graph_0)
 
     # Compute outputs from the last latent graph (if applicable).
-    return self._output(latent_graph_m)
+    return (self._output)(latent_graph_m)
 
   def _networks_builder(self, graph_template):
     if self._initialized:
@@ -179,13 +179,13 @@ class DeepTypedGraphNet(hk.Module):
       return jraph.concatenated_args(mlp)
 
     def build_mlp_with_maybe_layer_norm(name, output_size):
-      network = build_mlp(name, output_size)
+      network = hk.remat(build_mlp(name, output_size))
       if self._use_layer_norm:
-        layer_norm = hk.LayerNorm(
+        layer_norm = hk.remat(hk.LayerNorm(
             axis=-1, create_scale=True, create_offset=True,
-            name=name + "_layer_norm")
-        network = hk.Sequential([network, layer_norm])
-      return jraph.concatenated_args(network)
+            name=name + "_layer_norm"))
+        network = hk.remat(hk.Sequential([network, layer_norm]))
+      return (jraph.concatenated_args(network))
 
     # The embedder graph network independently embeds edge and node features.
     if self._embed_edges:
@@ -227,6 +227,7 @@ class DeepTypedGraphNet(hk.Module):
         if self._aggregate_normalization:
           output = output / self._aggregate_normalization
         return output
+    #aggregate_fn = hk.remat(aggregate_fn,static_argnums=(1,2))
 
     # Create `num_message_passing_steps` graph networks with unshared parameters
     # that update the node and edge latent features.
@@ -286,7 +287,10 @@ class DeepTypedGraphNet(hk.Module):
           context=input_graph.context._replace(features=()))
 
     # Embeds the node and edge features.
-    latent_graph_0 = self._embedder_network(input_graph)
+    # if (self.name == 'grid2mesh_gnn'):
+    #   latent_graph_0 = jax.lax.stop_gradient((self._embedder_network)(input_graph))
+    # else:
+    latent_graph_0 = (self._embedder_network)(input_graph)
     return latent_graph_0
 
   def _process(
@@ -309,17 +313,17 @@ class DeepTypedGraphNet(hk.Module):
     """Single step of message passing with node/edge residual connections."""
 
     # One step of message passing.
-    latent_graph_k = processor_network_k(latent_graph_prev_k)
+    latent_graph_k = hk.remat(processor_network_k)(latent_graph_prev_k)
 
     # Add residuals.
     nodes_with_residuals = {}
     for k, prev_set in latent_graph_prev_k.nodes.items():
-      nodes_with_residuals[k] = prev_set._replace(
+      nodes_with_residuals[k] = hk.remat(prev_set._replace)(
           features=prev_set.features + latent_graph_k.nodes[k].features)
 
     edges_with_residuals = {}
     for k, prev_set in latent_graph_prev_k.edges.items():
-      edges_with_residuals[k] = prev_set._replace(
+      edges_with_residuals[k] = hk.remat(prev_set._replace)(
           features=prev_set.features + latent_graph_k.edges[k].features)
 
     latent_graph_k = latent_graph_k._replace(
@@ -329,7 +333,7 @@ class DeepTypedGraphNet(hk.Module):
   def _output(self,
               latent_graph: typed_graph.TypedGraph) -> typed_graph.TypedGraph:
     """Produces the output from the latent graph."""
-    return self._output_network(latent_graph)
+    return (self._output_network)(latent_graph)
 
 
 def _build_update_fns_for_node_types(

@@ -7,7 +7,8 @@ import jax
 import jax.numpy as jnp
 import datetime
 import dask
-from forecast import generate_model
+import forecast.generate_model
+# from forecast import generate_model
 import matplotlib.pyplot as plt
 
 # Utility functions for dataset manipulation
@@ -128,17 +129,25 @@ def varstats(target_var,ensemble_vars):
     local_mae = sum( np.abs(e - target_var) for e in ensemble_vars)
     outer_spread = sum(np.abs(ensemble_vars[j] - ensemble_vars[k]) for j in range(len(ensemble_vars)) for k in range(j+1,len(ensemble_vars)))
 
+    # Unbiased eRMSE from Leutbecher 2007: https://doi.org/10.1016/j.jcp.2007.02.014 
+    # or eq5 of https://journals.ametsoc.org/view/journals/mwre/150/11/MWR-D-21-0315.1.xml?tab_body=fulltext-display
+
+    ub_emse = (((ens_mean - target_var)**2 - \
+                1/(N*(N-1)) * sum((e - ens_mean)**2 for e in ensemble_vars)).mean(dim='lon')*lat_weights_da).sum(dim='lat')
+    
+
+
     # No factor of 2 in fair CRPS calculation because the sum is over i, j>i
     local_fair_crps = local_mae/N - 1/(N*(N-1)) * outer_spread
     fair_crps = (local_fair_crps.mean(dim='lon')*lat_weights_da).sum(dim='lat')
-    return det_mse, ens_mse, spread_sq, fair_crps
+    return det_mse, ens_mse, spread_sq, fair_crps, ub_emse
 
 @jax.jit
 def ensstats(targets,ensemble):
     vstat = {}
     for var in targets.data_vars:
         stat = varstats(targets[var],[e[var] for e in ensemble])
-        vstat[var]=xr.concat(stat,dim='stat').assign_coords(stat=('stat',['detmse','ensmse','sqspread','crps']))
+        vstat[var]=xr.concat(stat,dim='stat').assign_coords(stat=('stat',['detmse','ensmse','sqspread','crps','ub_ensmse']))
     return vstat
 
 def allstats(targets,ensemble,vdate):
@@ -186,12 +195,14 @@ if __name__ == '__main__':
                                    '%Y%m%dT%H', # and YYYYMMDDTHH (ISO 8601-2019)
                                    '%Y%m%dT%HZ',# ... with UTC marker
                                   ])
+    assert(start_vdate is not None)
     end_vdate = dateparser.parse(args.end_vdate,
                                 ['%Y%m%d%H',  # Also parse YYYYMMDDHH (ISO 8601-2004)
                                  '%Y%m%d%HZ', # ... with UTC marker
                                  '%Y%m%dT%H', # and YYYYMMDDTHH (ISO 8601-2019)
                                  '%Y%m%dT%HZ',# ... with UTC marker
                                 ])
+    assert(end_vdate is not None)
     # start_vdate = datetime.datetime(2022,1,11,0) # First date for ensemble computation
     # end_vdate = datetime.datetime(2022,1,31,12) # Last date of ensemble computation
     vdate_interval = datetime.timedelta(hours=12) # Increments of evaluation date
@@ -320,4 +331,4 @@ if __name__ == '__main__':
     stats = xr.merge(stats)
     # stats_out[label] = stats
     print(f'Saving to {args.outpath}')
-    stats.to_zarr(args.outpath)
+    stats.to_zarr(args.outpath,mode='w')

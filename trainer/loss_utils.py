@@ -40,7 +40,8 @@ Parameters = (
     LossParameter('--wind-speed','wind_speed',bool,False,'Add wind speed variable to loss function'),
     LossParameter('--time-bias','time_bias',bool,False,'Add time-averaged term to loss function'),
     LossParameter('--mean-bias','mean_bias',bool,False,'Add global mean bias term to loss function'),
-    LossParameter('--spectral-amse','spectral_amse',bool,False,'Compute loss in spectral space, with correlation/ampltidue adjustment')
+    LossParameter('--spectral-amse','spectral_amse',bool,False,'Compute loss in spectral space, with correlation/ampltidue adjustment'),
+    LossParameter('--mae','mae',bool,False,'Compute loss with mean absolute error rather than MSE')
 )
 
 import argparse
@@ -217,6 +218,10 @@ def make_loss_new(model_config : 'graphcast.graphcast.ModelConfig',
     time_bias = config_dict['time_bias']
     mean_bias = config_dict['mean_bias']
     spectral_amse = config_dict['spectral_amse']
+    mae_error = config_dict['mae']
+
+    if (spectral_amse and mae_error):
+        raise ValueError('Cannot use both AMSE and MAE error calculations simultaneously')
 
     if (compute_wind_speed):
         if not silent: print('Computing loss function with wind speed added')
@@ -228,7 +233,7 @@ def make_loss_new(model_config : 'graphcast.graphcast.ModelConfig',
     if (mean_bias):
         if not silent: print('Computing loss function with additional global mean loss term')
 
-    if (spectral_amse):
+    if (spectral_amse): # Use spectral AMSE
         if not silent: print('Computing loss function in spectral space, with amplitude/correlation adjustment')
         # spectral AMSE is not compatible with time/mean bias loss
         if (time_bias or mean_bias):
@@ -250,6 +255,20 @@ def make_loss_new(model_config : 'graphcast.graphcast.ModelConfig',
             return spectral_adj_loss(prediction, targets,
                                  norms_by_level, sht_forward, 
                                  level_weights, per_variable_weights)
+    elif mae_error: # Use MAE
+        if not silent: print('Using mean absolute error for loss function')
+        if (time_bias or mean_bias):
+            raise (ValueError('MAE loss is not compatible with time-bias or mean-bias loss terms'))
+        def my_loss(prediction,targets):
+            prediction = derived_variables(prediction,compute_wind_speed)
+            targets = derived_variables(targets,compute_wind_speed)
+            return mae_loss(prediction,
+                            targets,
+                            per_variable_weights,
+                            level_weights,
+                            norms_by_level,
+                            latitude_weights)
+
     else:
         def my_loss(prediction,targets):
             prediction = derived_variables(prediction,compute_wind_speed)
@@ -349,6 +368,27 @@ def spatial_loss(prediction,targets,per_variable_weights,level_weights,norms_by_
         mse = mse + 0.1*mse_mean_bias
     total = sum((mse[i]*per_variable_weights.get(i,1.0) for i in mse.data_vars))
     return(total,mse)
+
+def mae_loss(prediction,targets,per_variable_weights,level_weights,norms_by_level,latitude_weights):
+    # print('Compiling loss/gradient (inside spatial_loss)')
+    # Remove any prediction variables that are not target variables.  This allows for slightly
+    # nicer computation of mock errors, such as MSE(ic,target) for analysis persistence
+    import numpy as np
+    from graphcast import xarray_jax
+    prediction = prediction[set(targets.data_vars)]
+    diffs = targets - prediction
+    # diffs = diffs/norm_by_level
+
+    # Apply level weightings for both quadature and variable normalization at the same time
+    adj_level_weights = level_weights / norms_by_level
+
+    # Construct the mean squared error from the inside out, based on likely variable ordering.
+    # Jax's jit tends to exchange loops for the best order, but this helps speed non-jit calculations.
+    mae = ((np.abs(diffs).mean(dim='lon') * latitude_weights).mean(dim='lat')*adj_level_weights).\
+            sum(dim='level').mean(dim=('time','batch'))
+    
+    total = sum((mae[i]*per_variable_weights.get(i,1.0) for i in mae.data_vars))
+    return(total,mae)
 
 def unwrap_mean(f):
     '''A helper function, to take a loss function that returns a loss with some sort of structure

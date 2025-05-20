@@ -20,6 +20,16 @@ def load_model(params_file):
         ckpt = checkpoint.load(f, graphcast.CheckPoint)
     return(ckpt.model_config, ckpt.task_config, ckpt.params)
 
+def get_model_coords(model_config):
+    import xarray as xr
+    import numpy as np
+    model_latitude = xr.DataArray(np.linspace(-90,90,int(1+180/model_config['resolution']),dtype=np.float32),dims='latitude')
+    model_latitude = model_latitude.assign_coords({'latitude' : model_latitude})
+    model_longitude = xr.DataArray(np.linspace(0,360-model_config['resolution'],int(360/model_config['resolution']),dtype=np.float32),
+                                dims='longitude')
+    model_longitude = model_longitude.assign_coords({'longitude' : model_longitude})
+    return (model_latitude, model_longitude)
+
 def build_loss_and_grad(model_config, task_config, use_float16=True, custom_loss_fn = None, 
                         diffs_stddev_by_level = None, mean_by_level = None, stddev_by_level = None):
     '''Construct a wrapped GraphCast function to compute RMSE loss and

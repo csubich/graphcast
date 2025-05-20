@@ -155,9 +155,20 @@ def build_forecast(idate,forecast_length,task_config,
     # Manually convert levels and times to integer indices in the
     # databases, to use .isel rather than .sel for selection.
     try:
-        a_level_idx = np.searchsorted(a_dbase.level.data,input_levels)
+        # Note: numpy.searchsorted only works when the seached-in array is in
+        # ascending order.  Our underlying data might be in either ascending
+        # or descending order, so accommodate either
+        if (a_dbase.level.data[1] > a_dbase.level.data[0]): # Ascending order, search normally
+            a_level_idx = np.searchsorted(a_dbase.level.data,input_levels)
+        else: # Presumably descending order, so reverse the database-level array, search, and adjust the index
+            a_level_idx = a_dbase.level.size - np.searchsorted(a_dbase.level.data[::-1],input_levels) - 1
         assert(all(a_dbase.level.data[a_level_idx] == input_levels))
-        v_level_idx = np.searchsorted(v_dbase.level.data,input_levels)    
+
+        # Repeat for verification data
+        if (v_dbase.level.data[1] > v_dbase.level.data[0]): # Ascending order
+            v_level_idx = np.searchsorted(v_dbase.level.data,input_levels)    
+        else: # Presume descending
+            v_level_idx = v_dbase.level.size - np.searchsorted(v_dbase.level.data[::-1],input_levels) - 1
         assert(all(v_dbase.level.data[v_level_idx] == input_levels))
 
         a_time_idx = np.searchsorted(a_dbase.time.data,atimes_ns)
@@ -339,12 +350,12 @@ def open_one_database(path_glob):
 
     # Suppress ECCodes warning
     with warnings.catch_warnings(action="ignore"):
-        dbase_paths = sorted(list(glob.glob(f'{path_glob}/*/*')))
+        dbase_paths = sorted(list(glob.glob(path_glob)))
 
         # * Open each month separately
         # * Drop toa_incident_solar_radiation if present (it's not consistently present and causes bad chunking on merge)
         # * set a chunk size of 1 in time
-        dbase_by_month = [xr.open_dataset(path,cache=False,engine='zarr').chunk(time=1) for path in dbase_paths]
+        dbase_by_month = [xr.open_dataset(path,cache=False,engine='zarr', chunks={}).chunk(time=1) for path in dbase_paths]
         dbase_by_month_norad = [ d[[v for v in d.data_vars if v != 'toa_incident_solar_radiation']] for d in dbase_by_month ]
 
     # Concatenate each moth together. compat='override' takes the first-encountered value for variables that are time-independent
@@ -368,7 +379,7 @@ def open_databases(a_dbase_path, v_dbase_path):
     import dask # For graph optimization
     import warnings
 
-    a_dbase = open_one_database(a_dbase_path)
+    a_dbase = open_one_database(f'{a_dbase_path}/*/*')
 
     # Assert that levels and times are sorted
     assert(all(np.sort(a_dbase.level.data) == a_dbase.level.data))
@@ -384,7 +395,7 @@ def open_databases(a_dbase_path, v_dbase_path):
     elif (v_dbase_path is None):
         v_dbase = None
     else:
-        v_dbase = open_one_database(v_dbase_path)
+        v_dbase = open_one_database(f'{v_dbase_path}/*/*')
         assert(all(np.sort(v_dbase.level.data) == v_dbase.level.data))
         assert(all(np.sort(v_dbase.time.data) == v_dbase.time.data))
 

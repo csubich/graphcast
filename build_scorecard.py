@@ -1,17 +1,3 @@
-# Copyright 2024 Crown in Right of Canada
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS-IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # "Scorecard" style bulk forecaster
 
 ## Helper class to store a forecast sequence, noting its initialization date and the current
@@ -75,7 +61,7 @@ def load_climato(targets,climato_dbase,target_variables):
     return climato_now
 
 gpu_time = 0
-def advance_forecast(idate,device_queue,inputs_cpu,targets_cpu,forcings_cpu,climato_cpu,predictor,climato_level_idx):
+def advance_forecast(idate,device_queue,inputs_cpu,targets_cpu,tspec_cpu,forcings_cpu,climato_cpu,predictor,climato_level_idx,mask_hurr_reg):
     # Get paramters from device_data dictionary 
     import datetime
     global gpu_time
@@ -86,12 +72,14 @@ def advance_forecast(idate,device_queue,inputs_cpu,targets_cpu,forcings_cpu,clim
     targets_gpu = device_data['targets'] # Targets if on GPU, else None
     forcings_gpu = device_data['forcings'] # Forcings if on GPU, else None
     climato_gpu = device_data['climato'] # Climato array if on GPU, else None
+    tspec_gpu = device_data['tspec'] # Spherical harmonic of targets if on-GPU, else None
 
     # Push data to GPU if not already present
     inputs_gpu = wrap_dataset(inputs_cpu,gpu_device)
     if targets_gpu is None: targets_gpu = wrap_dataset(targets_cpu,gpu_device)
     if forcings_gpu is None: forcings_gpu = wrap_dataset(forcings_cpu,gpu_device)
     if climato_gpu is None: climato_gpu = wrap_dataset(climato_cpu,gpu_device)
+    if tspec_gpu is None and tspec_cpu is not None: tspec_gpu = wrap_dataset(tspec_cpu,gpu_device)
 
     # Perform one-step prediction
     assert(forcings_gpu.time.size == 1)
@@ -100,17 +88,35 @@ def advance_forecast(idate,device_queue,inputs_cpu,targets_cpu,forcings_cpu,clim
     # Stack the current inputs and the prediction to give next-step inputs
     inputs_next = stack_inputs(inputs_gpu,prediction_gpu,forcings_gpu)
 
-    # Compute the scorecard for the current prediction
-    scorecard = scorecard_jit(prediction_gpu.isel(time=0,batch=0,drop=True),
-                              targets_gpu.isel(time=0,batch=0,drop=True),
-                              climato_gpu,
-                              tuple(climato_level_idx))
+    # add speed variables
+    from trainer.loss_utils import derived_variables
+    prediction_gpu2 = derived_variables(prediction_gpu, compute_wind_speed = True )
+    targets_gpu2    = derived_variables(targets_gpu,    compute_wind_speed = True )
+    climato_gpu2    = derived_variables(climato_gpu,    compute_wind_speed = True )
+
+    # If provided target spectrum information, compute power spectral density and coherence of
+    # prediction versus target
+    if (tspec_gpu is not None):
+        this_speccard = speccard_jit(prediction_gpu2.isel(time=0,batch=0,drop=True),
+                                     tspec_gpu)
+        pass
+    else:
+        this_speccard = None
 
     del prediction_gpu
+
+    # Compute the scorecard for the current prediction
+    scorecard = scorecard_jit(prediction_gpu2.isel(time=0,batch=0,drop=True), mask_hurr_reg,
+                              targets_gpu2.isel(time=0,batch=0,drop=True),
+                              climato_gpu2,
+                              tuple(climato_level_idx))
+
+    del prediction_gpu2, targets_gpu2, climato_gpu2
     
-    # Repopulate thhe device_data dictionary, including the on-device targets/forcings/climato
+    # Repopulate the device_data dictionary, including the on-device targets/forcings/climato
     out_device_data = {'device' : gpu_device, 'params' : params,
-                       'targets' : targets_gpu, 'forcings' : forcings_gpu,
+                       'targets' : targets_gpu, 'tspec' : tspec_gpu,
+                       'forcings' : forcings_gpu,
                        'climato' : climato_gpu}
     
     # Push the device data back to the GPU queue
@@ -120,11 +126,13 @@ def advance_forecast(idate,device_queue,inputs_cpu,targets_cpu,forcings_cpu,clim
     # Move next-input and scorecard data off-GPU
     inputs_next = unwrap_ds(inputs_next)
     scorecard = {key : unwrap_ds(scorecard[key]) for key in scorecard.keys()}
+    if (tspec_gpu is not None):
+        this_speccard = {key : unwrap_ds(this_speccard[key]) for key in this_speccard.keys()}
 
     gpu_time += (toc-tic).total_seconds()
 
 
-    return (idate, inputs_next, scorecard)
+    return (idate, inputs_next, scorecard, this_speccard)
 
 # Helper data movement functions
 def slice_target(target_future):
@@ -136,32 +144,103 @@ def cpuwrap_future(ds):
     # Wrap a generic future-returned dataset as on-cpu Jax arrays (used for climatology)
     return wrap_dataset(ds.result(),cpu_device)
 
-def scorecard(prediction,target,climato,climato_level_idx):
+def sht_ds(ds_in,sht_forward):
+    # Given an input prediction (or analysis) as an XArray dataset and the forward transform function, 
+    # compute the spherical harmonic transform and return a new dataset.  Suitable for JIT compilation.
+
+    from graphcast import xarray_jax
+    from jax import tree_util
+
+    exploded = xarray_jax.unwrap_vars(ds_in)
+    spec_dict = tree_util.tree_map(sht_forward,exploded)
+    rewrapped = xarray_jax.Dataset( {v : (ds_in[v].dims[:-2] + ('zonal_wavenumber','total_wavenumber'), spec_dict[v]) for v in spec_dict.keys()},
+                                   coords=ds_in[set(ds_in.coords) - {'latitude','longitude','lat','lon'}].coords)
+    rewrapped = rewrapped.assign_coords(total_wavenumber = ('total_wavenumber', np.arange(ds_in.lat.size)))
+    return rewrapped
+
+def power_spectra(spec):
+    # Given an XArray dataset of spherical power spectra, compute the power spectrum
+    # by total wavenumber
+    from graphcast import xarray_jax
+    from jax import tree_util
+    from trainer.spectrum import power_spectral_density
+
+    # The PSD computation function does not work with the fully wrapped dataset, so use unwrap_vars
+    # to get a tree structure of (key, array) pairings
+    exploded = xarray_jax.unwrap_vars(spec)
+
+    # Compute the power spectrum of this dictionary by mapping over the 'pytree'
+    power_spec_dict = tree_util.tree_map(power_spectral_density,exploded)
+
+    # Rebuild the xarray dataset, copying coordinates from the supplied arrays
+    power = xarray_jax.Dataset( {v : (spec[v].dims[:-2] + ('total_wavenumber',), power_spec_dict[v]) for v in power_spec_dict.keys()},
+                               coords = spec.coords)
+    return power
+
+def cross_spectra(pspec, tsoec):
+    # Given spherical spectra for a prediction and analysis, compute the cross spectrum 
+    #  against the analysis, by total wavenumber
+    # Suitable for compilation with jax
+    from graphcast import xarray_jax
+    from jax import tree_util
+    from trainer.spectrum import cross_spectral_density
+
+    # Get a tree representation of the prediction and analysis spectra, "exploding" the
+    # XArray dataset
+    pexplode = xarray_jax.unwrap_vars(pspec)
+    aexplode = xarray_jax.unwrap_vars(tsoec)
+
+    # Compute the power spectrum and cross spectrum
+    cross_spec_dict = tree_util.tree_map(cross_spectral_density,pexplode,aexplode)
+
+    # Rebuild the XArrays for return
+    cross = xarray_jax.Dataset( {v : (pspec[v].dims[:-2] + ('total_wavenumber',), cross_spec_dict[v]) for v in cross_spec_dict.keys()},
+                               coords = pspec.coords)
+    return (cross)
+
+def speccard(prediction, tspec, sht_func):
+    # Given a prediction field, target spectrum, and tansformation function, compute the "spectral scorecard"
+    # containing power sepctral density of the prediction and the cross spectral density between the prediction
+    # and target (analysis), by variable and level
+
+    pspec = sht_func(prediction)
+    ppower = power_spectra(pspec)
+    # tpower = power_spectra(tspec) # Not needed for cross spectral density
+    cross = cross_spectra(pspec,tspec)
+    return {'psd' : ppower, 'csd' : cross}
+
+
+def scorecard(prediction,mask_hurr_reg, target,climato,climato_level_idx):
     # Compute the scorecard between predictions, analysis (target), and climatology, for all variables
     # and levels present in the climatology
     import graphcast.losses
     climato_level_idx = list(climato_level_idx)
 
-    
     latitude_weight = graphcast.losses._weight_for_latitude_vector_with_poles(target.lat)
     longitude_weight = 1/target.lon.size
+
+    # Apply masking to latitude/longitude weight, creating a number of 2D fields.  Note that the total sum
+    # of the masked fields should be 1, so that mean and standard deviation values are comparable between
+    # regions
+    mask_unweighted = (latitude_weight*longitude_weight*mask_hurr_reg)
+    mask_weighted = mask_unweighted / mask_unweighted.sum(dim=('lat','lon'))
     
     # prediction - analysis bias
-    pa_bias = ((prediction - target)*latitude_weight*longitude_weight).sum(dim=('lat','lon'))
+    pa_bias = ((prediction - target)*mask_weighted).sum(dim=('lat','lon'))
     # prediction - analysis standard deviation (central)
-    pa_std = (((prediction - target - pa_bias)**2 * latitude_weight * longitude_weight).sum(dim=('lat','lon')))**0.5
+    pa_std = (((prediction - target - pa_bias)**2 * mask_weighted).sum(dim=('lat','lon')))**0.5
     
     # Predictions vs climatology, see 
     # https://confluence.ecmwf.int/display/FUG/Section+12.A+Statistical+Concepts+-+Deterministic+Data#Section12.AStatisticalConceptsDeterministicData-TheDecompositionofMSE
     
     # Activity of prediction and analysis
-    pc_act = ((prediction.isel(level=climato_level_idx) - climato)**2*latitude_weight*longitude_weight).sum(dim=('lat','lon'))**0.5
-    ac_act = ((target.isel(level=climato_level_idx) - climato)**2*latitude_weight*longitude_weight).sum(dim=('lat','lon'))**0.5
+    pc_act = ((prediction.isel(level=climato_level_idx) - climato)**2*mask_weighted).sum(dim=('lat','lon'))**0.5
+    ac_act = ((target.isel(level=climato_level_idx) - climato)**2*mask_weighted).sum(dim=('lat','lon'))**0.5
     
     # Anomaly correlation coefficient
     acc = ((prediction.isel(level=climato_level_idx)-climato)*\
            (target.isel(level=climato_level_idx)-climato)*\
-           latitude_weight*longitude_weight).sum(dim=('lat','lon')) / (pc_act*ac_act)
+           mask_weighted).sum(dim=('lat','lon')) / (pc_act*ac_act)
 
     return({'bias' : pa_bias,
             'std' : pa_std,
@@ -181,15 +260,30 @@ short_names = {'10m_u_component_of_wind' : '10u',
                'v_component_of_wind' : 'v',
                'vertical_velocity' : 'w'}
 
+def process_speccard(icard,idate,date_now):
+    # Merge "spectral scorecards" from independent forecasts into a single aggregate.
+    # Unlike process_scorecard, this function will use the valid date as its canonical
+    # date variable.  From the power and cross spectral densities, amplitude ratio and
+    # coherence are found by scaling against the analysis PSD, and that requires every
+    # field be valid at the same time.
+    import xarray as xr
+    import numpy as np
+    lead_time = np.timedelta64(date_now-idate,'ns')
+    cards = [ icard[key].rename(short_names).assign_coords({'stat' : [key,],
+                                                            'lead_time' : [lead_time,],
+                                                            'valid_date' : [np.datetime64(date_now.replace(tzinfo=None),'ns'),],
+                                                           }) for key in icard.keys()]
+    return xr.concat(cards,dim='stat')                                                            
+
 def process_scorecard(icard,idate,date_now):
     import xarray as xr
     import numpy as np
     lead_time = np.timedelta64(date_now-idate,'ns')
-    cards = [ icard[key].rename(short_names).assign_coords({'class' : [key,], 
+    cards = [ icard[key].rename(short_names).assign_coords({'stat' : [key,], 
                                                             'lead_time' : [lead_time,], 
                                                             'idate' : [np.datetime64(idate.replace(tzinfo=None),'ns'),] # Strip any timezone info
                                                             }) for key in icard.keys()]
-    return xr.concat(cards,dim='class')
+    return xr.concat(cards,dim='stat')
 
 def stamp(idate):
     # Helper function to return a YYYY-MM-DDTHH datetamp given
@@ -205,8 +299,6 @@ if __name__ == '__main__':
     # Enable faulthandler to get tracebacks on signals like sigsegv
     faulthandler.enable()
 
-                    
-
     import argparse
     ## Command-line arguments
     parser = argparse.ArgumentParser()
@@ -214,12 +306,14 @@ if __name__ == '__main__':
     parser.add_argument('--cpath',type=str,dest='cpath',default='../era5_climatology.zarr',help='Location of climatology')
     parser.add_argument('--start-date',type=str,dest='start_date',default='1 Jan 2023 00:00',help='Starting date/time')
     parser.add_argument('--end-date',type=str,dest='end_date',default='31 Dec 2023 18:00',help='Ending date/time (inclusive)')
-    parser.add_argument('--forecast-length',type=int,dest='forecast_length',default=1)
+    parser.add_argument('--forecast-length',type=int,dest='forecast_length',default=6,help='Maximum forecast length (hours)')
     parser.add_argument('--to-path',type=str,dest='outpath',help='Output file for scores')
     parser.add_argument('--model-checkpoint',type=str,dest='model_checkpoint',help='Model checkpoint to load')
     parser.add_argument('--init-interval',type=int,dest='init_interval',default=6,help='How often to initialize a new forecast (h)')
     parser.add_argument('--norm-factors',type=str,dest='norm_path',default=None,
                         help='Path to the directory containing Graphcast normalization factors')
+    parser.add_argument('--spectrum-leads',type=int,nargs='*',dest='spectrum_leads',help='Lead times in hours for spectrum computation (leave blank for no spectrum)')
+    parser.add_argument('--spectrum-output',type=str,dest='specpath',help='Output file for spectrum',default=None)
 
     ## Runtime parameters, to be set from the command line
     args = parser.parse_args()
@@ -256,6 +350,13 @@ if __name__ == '__main__':
     # Path to graphcast parameters
     params_path = args.model_checkpoint # 'params/GraphCast - ERA5 1979-2017 - resolution 0.25 - pressure levels 37 - mesh 2to6 - precipitation input and output.npz'
     outpath = args.outpath
+    specpath = args.specpath
+    spectrum_leads = [float(f) for f in args.spectrum_leads]
+    if len(spectrum_leads) > 0:
+        compute_spectrum=True
+        assert(specpath is not None)
+    else:
+        compute_spectrum=False
 
 
     start_date = dateparser.parse(args.start_date,
@@ -339,14 +440,18 @@ if __name__ == '__main__':
                                                                diffs_stddev_by_level = diffs_stddev_by_level, 
                                                                mean_by_level = mean_by_level,
                                                                stddev_by_level = stddev_by_level)
+    # generate hurricane mask
+    from hurr_scorecard_mask.mask_hurr_generate import mask_hurr_gen
+    mask_hurr_reg = mask_hurr_gen()
+
     # JIT compile the scorecard calculator
-    scorecard_jit = jax.jit(scorecard,static_argnums=(3,))   
+    scorecard_jit = jax.jit(scorecard,static_argnums=(4,))   
     stack_inputs = jax.jit(stack_inputs) 
 
     import forecast.forecast_variables
 
     gpu_skeleton = [{'device' : dev, 'params' : jax.device_put(params,dev),
-                'inputs' : None, 'targets' : None, 'forcings' : None, 'climato' : None} for dev in jax.devices('gpu')[:num_gpus]]
+                'inputs' : None, 'targets' : None, 'tspec' : None, 'forcings' : None, 'climato' : None} for dev in jax.devices('gpu')[:num_gpus]]
     
     forecast_set = []
     output_futures = []
@@ -365,20 +470,40 @@ if __name__ == '__main__':
     print(f'using {num_gpus} GPUs and {num_procs} CPUs')
     print(f'with model checkpoint {params_path}')
     print(f'and output written to {outpath}')
+    if (compute_spectrum):
+        print(f'Also computing spectrum at {", ".join(f"{d}h" for d in spectrum_leads)}')
+        print(f'   and writing output to {specpath}')
     sys.stdout.flush()
 
+    # If computing spectrum, get assoicated weights
+    if (compute_spectrum):
+        import trainer.spectrum
+        leg_coefs = trainer.spectrum.generate_spectral_coefs(model_latitude.data)
+
+        do_sht_array = lambda f: trainer.spectrum.sht_eval(leg_coefs,f)
+        do_sht_ds = lambda f: sht_ds(f,do_sht_array)
+        do_speccard = lambda pred, tspec: speccard(pred,tspec,do_sht_ds)
+
+        sht_ds_jit = jax.jit(do_sht_ds)
+        speccard_jit = jax.jit(do_speccard)
+    else:
+        speccard_jit = None
+        sht_ds_jit = None
+
     # Set a 'watchdog timer' to dump a traceback if execution hangs
-    faulthandler.dump_traceback_later(120,exit=True)
+    # Set a long timeout at first, to account for jax compilation
+    faulthandler.dump_traceback_later(600,exit=True)
     gtic = datetime.datetime.now()
     import queue
     gpu_queue = queue.Queue()
 
     with (concurrent.futures.ThreadPoolExecutor(max_workers=max(1,num_gpus+1)) as gpu_executor,
-          dask.distributed.Client(processes=False) as Client):
+          dask.distributed.Client(processes=False,threads_per_worker=len(os.sched_getaffinity(0))) as Client):
         # List of current forecasts, format (idate, inputs)
         forecast_ics = []
         # Output of per-forecast scorecards, for later merging
         out_scorecards = []
+        out_speccards = []
 
         ## Get first set of iniitial conditions
 
@@ -407,7 +532,7 @@ if __name__ == '__main__':
         # Load/compute all data
         (targets_m6h,targets_0h,targets_p6h,
         forcings_m6h,forcings_0h,forcings_p6h,
-        climato_p6h) = Client.compute((targets_m6h,targets_0h,targets_p6h,forcings_m6h,forcings_0h,forcings_p6h,climato_p6h),sync=True)
+        climato_p6h, mask_hurr_reg) = Client.compute((targets_m6h,targets_0h,targets_p6h,forcings_m6h,forcings_0h,forcings_p6h,climato_p6h,mask_hurr_reg),sync=True)
         del ignore
 
         while (now_date < end_date):
@@ -438,12 +563,28 @@ if __name__ == '__main__':
                 (targets_next_f,forcings_next_f,climato_next_f) = Client.compute((targets_next,forcings_next,climato_next),sync=False)
                 del climato_next, forcings_next, targets_next, ignore
 
+            if (compute_spectrum):
+                # If computing spectrum, take the transform of the target field including derived variables
+                import trainer.loss_utils
+                expanded_analysis = trainer.loss_utils.derived_variables(targets_p6h,compute_wind_speed=True).isel(time=0,batch=0,drop=True)
+                tspec = unwrap_ds(sht_ds_jit(expanded_analysis))
+
+                # Build "speccard" for the analysis itself, 0h lead time
+                analysis_speccard = speccard_jit(expanded_analysis,tspec)
+                # The values are now on GPU, so unwrap them
+                analysis_speccard = {key: unwrap_ds(analysis_speccard[key]) for key in analysis_speccard.keys()}
+                # print(analysis_speccard)
+                out_speccards.append(process_speccard(analysis_speccard,next_date,next_date))
+            else:
+                tspec = None
+
             #for (idate, inputs) in forecast_ics:
             while len(forecast_ics) > 0:
                 (idate,inputs) = forecast_ics.pop()
                 # print(f'  Queueing existing forecast from {stamp(idate)}')
                 forecast_futures.append(gpu_executor.submit(advance_forecast,idate,gpu_queue,inputs,
-                                                        targets_p6h,forcings_p6h,climato_p6h,predictor,climato_level_idx))
+                                                        targets_p6h,tspec,
+                                                        forcings_p6h,climato_p6h,predictor,climato_level_idx,mask_hurr_reg))
                 del inputs # Remove memory reference, allowing garbage collection
 
             # Check to see if we should initialize a new forecast
@@ -451,12 +592,16 @@ if __name__ == '__main__':
                 # print(f'  Initializing new input for {stamp(now_date)}')
                 inputs_new = new_inputs(targets_m6h,targets_0h,forcings_m6h,forcings_0h,static_vars)
                 forecast_futures.append(gpu_executor.submit(advance_forecast,now_date,gpu_queue,inputs_new,
-                                                        targets_p6h,forcings_p6h,climato_p6h,predictor,climato_level_idx))
+                                                        targets_p6h,tspec,
+                                                        forcings_p6h,climato_p6h,predictor,climato_level_idx,mask_hurr_reg))
                 del inputs_new # Remove memory reference
 
+
             for completed_future in concurrent.futures.as_completed(forecast_futures):
-                (idate,inputs_next,scorecard) = completed_future.result()
+                (idate,inputs_next,scorecard,this_speccard) = completed_future.result()
                 count += 1
+                if (compute_spectrum and (next_date - idate)/datetime.timedelta(hours=1) in spectrum_leads):
+                    out_speccards.append(process_speccard(this_speccard,idate,next_date))
                 out_scorecards.append(process_scorecard(scorecard,idate,next_date))
                 # print(f'  Received forecast for {stamp(idate)} init, Z500: {float(scorecard["std"].geopotential.sel(level=500).data):.2f}')
                 if ( (next_date - idate) < forecast_length and next_date <= end_date ):
@@ -496,15 +641,32 @@ if __name__ == '__main__':
     gtime = (gtoc-gtic).total_seconds()
     print(f'{gpu_time:.2f}s GPU time of {gtime:.2f}s, ratio {100*gpu_time/gtime/num_gpus:.2f}%')
 
+    # Cancel watchdog
+    faulthandler.cancel_dump_traceback_later()
+
     out_dataset = xr.combine_by_coords(out_scorecards)
     out_dataset.coords['valid_date'] = out_dataset['idate'] + out_dataset['lead_time']
+
+    if (compute_spectrum):
+        out_spec = xr.combine_by_coords(out_speccards)
+        out_spec.coords['idate'] = out_spec['valid_date'] - out_spec['lead_time']
 
     if (os.path.exists(outpath)):
         print(f'{outpath} exists already, removing')
         import shutil
         shutil.rmtree(outpath)
 
+
+    print(f'Writing to {outpath}')
     out_dataset.to_zarr(outpath,compute=True)
+    
+    if (compute_spectrum):
+        if(os.path.exists(specpath)):
+            print(f'{specpath} exists already, removing')
+            import shutil
+            shutil.rmtree(specpath)
+        print(f'Writing to {specpath}')
+        out_spec.to_zarr(specpath,compute=True)
+        
 
-
-
+    print(f'… complete')
